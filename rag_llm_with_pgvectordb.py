@@ -3,17 +3,15 @@
 import os
 import sys
 import re
-import math
 import click
 import numpy
 import psycopg
 from groq import Groq
-from pathlib import Path
 from pypdf import PdfReader
 from psycopg.rows import dict_row
 from dataclasses import dataclass
+from typing import List, Tuple, Dict
 from pgvector.psycopg import register_vector
-from typing import List, Tuple, Dict, Optional
 from sentence_transformers import SentenceTransformer
 
 
@@ -193,6 +191,9 @@ class Embed:
             text,
             normalize_embeddings=True
         )
+        # numpy.set_printoptions(threshold=numpy.inf,
+        #                        precision=6, suppress=True, linewidth=180)
+        # print(embeds[0])
         return numpy.asarray(embeds, dtype=numpy.float32)
 
 
