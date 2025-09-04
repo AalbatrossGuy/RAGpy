@@ -146,3 +146,38 @@ class VectorDBStore:
                     batch_rows
                 )
             connection.commit()
+            
+    def search(
+        self,
+        embedded_query: numpy.ndarray,
+        top_k: int = 6
+    ) -> List[Tuple[Chunk, float]]:
+        query_vector = embedded_query.tolist()
+        with psycopg.connect(self.url, row_factory=dict_row) as connection:
+            register_vector(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT chunk_id, page, character_offset, content,
+                        (text_embedding <=> %s::vector) AS cosine_distance
+                    FROM {self.table}
+                    ORDER BY text_embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (query_vector, query_vector, top_k)
+                )
+                rows = cursor.fetchall()
+            
+        out: List[Tuple[Chunk, float]] = []
+        for r in rows:
+            _chunk = Chunk(
+                id=r["chunk_id"],
+                content=r["content"],
+                metadata={
+                    "page": r["page"],
+                    "character_offset": r["character_offset"]
+                }
+            )
+            similarity = float(1.0 - r["cosine_distance"])
+            out.append((_chunk, similarity))
+        return out
