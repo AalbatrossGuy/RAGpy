@@ -1,15 +1,25 @@
+from openai import APIConnectionError, APIStatusError, RateLimitError, APITimeoutError
+from typing import List, Optional
+from dataclasses import dataclass
+import numpy as np
+import math
 import os
-import sys
 import click
 import numpy
+import time
 import psycopg
+import requests
 from groq import Groq
+from nomic import embed
+from dotenv import load_dotenv
 from psycopg.rows import dict_row
-from transformers import AutoTokenizer
+# from transformers import AutoTokenizer
 from pgvector.psycopg import register_vector
 from typing import List, Tuple, Optional, Iterable
-from sentence_transformers import SentenceTransformer
+# from sentence_transformers import SentenceTransformer
 from xmlchunker import Chunk, XMLChunker
+
+load_dotenv()
 
 
 class VectorDBStore:
@@ -17,7 +27,7 @@ class VectorDBStore:
         self,
         url: str,
         table: str = "chunks",
-        text_dim: int = 384
+        text_dim: int = 768
     ):
         self.url = url
         self.table = table
@@ -92,9 +102,9 @@ class VectorDBStore:
                 cursor.execute(
                     f"""
                     SELECT chunk_id, page, character_offset, content,
-                        (text_embedding <=> %s::vector) AS cosine_distance
+                        (text_embedding <=> %s::vector(768)) AS cosine_distance
                     FROM {self.table}
-                    ORDER BY text_embedding <=> %s::vector
+                    ORDER BY text_embedding <=> (%s)::vector(768)
                     LIMIT %s;
                     """,
                     (query_vector, query_vector, top_k)
@@ -119,46 +129,95 @@ class VectorDBStore:
 class Embed:
     def __init__(
         self,
-        model: str = "sentence-transformers/all-MiniLM-L6-v2"
+        model: str = "nomic-embed-text-v1.5",
+        dim: int = 768,
+        api_key: Optional[str] = None,
+        request_timeout: int = 60,
+        max_retries: int = 5,
+        backoff_base: float = 0.8,
+        backoff_factor: float = 1.8,
+        l2_normalize: bool = True,
+        task_type: str = "search_document",
+        long_text_mode: str = "truncate",
+        inference_mode: str = "remote"
     ):
-        self.model = SentenceTransformer(model)
-        validation_vector = self.model.encode(
-            ["validate"],
-            normalize_embeddings=True
-        )
-        self.dim = int(validation_vector.shape[1])
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model)
-        except Exception:
-            self.tokenizer = None
+        self.model = model
+        self.dim = dim
+        self.api_key = api_key or os.getenv("NOMICAI_API_KEY")
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self.backoff_factor = backoff_factor
+        self.l2_normalize = l2_normalize
+        self.task_type = task_type
+        self.long_text_mode = long_text_mode
+        self.inference_mode = inference_mode
 
-    def encode_embed(
+        if not self.api_key:
+            raise RuntimeError("NOMIC_API_KEY not set")
+
+        os.environ.setdefault("NOMIC_API_KEY", self.api_key)
+
+    def encode_embed(self, texts: List[str], batch_size: int = 64) -> numpy.ndarray:
+        """
+        Returns float32 ndarray of shape [len(texts), self.dim].
+        """
+        if not texts:
+            return numpy.zeros((0, self.dim), dtype=np.float32)
+
+        out: List[List[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            tries = 0
+            while True:
+                tries += 1
+                try:
+                    resp = embed.text(
+                        texts=batch,
+                        model=self.model,
+                        task_type=self.task_type,
+                        inference_mode="remote",
+                        long_text_mode="truncate",
+                        dimensionality=self.dim,
+                    )
+                    out.extend(resp["embeddings"])
+                    break
+
+                except Exception:
+                    if tries >= self.max_retries:
+                        raise
+                    time.sleep(self._sleep_for(tries))
+                    continue
+
+        arr = numpy.asarray(out, dtype=np.float32)
+
+        if self.l2_normalize and arr.size:
+            norms = numpy.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
+            arr = arr / norms
+
+        return arr
+
+    def encode_embed_stream(
         self,
-        text: List[str],
-        batch_size: int = 50
-    ) -> numpy.ndarray:
-        embeds = self.model.encode(
-            text,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False
-        )
-        # numpy.set_printoptions(threshold=numpy.inf,
-        #                        precision=6, suppress=True, linewidth=180)
-        # print(embeds[0])
-        return numpy.asarray(embeds, dtype=numpy.float32)
+        texts_iter: Iterable[str],
+        batch_size: int = 32
+    ):
+        batch: List[str] = []
+        for t in texts_iter:
+            batch.append(t)
+            if len(batch) == batch_size:
+                yield self.encode_embed(batch, batch_size=batch_size)
+                batch.clear()
+        if batch:
+            yield self.encode_embed(batch, batch_size=len(batch))
 
-    def count_tokens(
-        self,
-        text: str
-    ) -> int:
-        if not text:
-            return 0
-
-        if self.tokenizer is not None:
-            return len(self.tokenizer.encode(text, add_special_tokens=False))
-
+    def count_tokens(self, text: str) -> int:
+        # very rough token budgeter for chunk sizing
         return max(1, len(text.split()))
+
+    def _sleep_for(self, attempt: int) -> float:
+        return self.backoff_base * (self.backoff_factor ** (attempt - 1)) + (0.05 * numpy.random.rand())
 
 
 class RAGRetrieverModel:
@@ -176,6 +235,7 @@ class RAGRetrieverModel:
         top_k: int = 6
     ) -> List[Tuple[Chunk, float]]:
         query = self.embedder.encode_embed([query])[0]
+        print(query)
         return self.vectorStore.search(embedded_query=query, top_k=top_k)
 
 
@@ -282,7 +342,8 @@ def get_response(
         client,
         CONTEXT_WITH_QUESTION.format(question=query, context=context)
     )
-    # print(f"UNFILTERED RESPONSE = {response}")
+    print(f"\n\nCONTEXT = {context}")
+    print(f"UNFILTERED RESPONSE = {response}\n\n")
     if fallback in response:
         print('fallback encountered')
         return fallback
@@ -298,12 +359,12 @@ class XMLIngestor:
         db: VectorDBStore,
         embedder: Embed,
         semantic: bool = True,
-        soft_target_token: int = 200,
-        max_tokens: int = 400,
-        intersections: int = 10,
-        similarity_floor: float = 0.212,
-        batch_size_embed: int = 256,
-        upsert_batch_size: int = 500,
+        soft_target_token: int = 140,
+        max_tokens: int = 200,
+        intersections: int = 5,
+        similarity_floor: float = 0.20,
+        batch_size_embed: int = 8,
+        upsert_batch_size: int = 150,
         on_flush: Optional[callable] = None
     ) -> None:
         self.db = db
@@ -355,27 +416,63 @@ class XMLIngestor:
         # else:
         # Add code for fallback to legacy regex based chunking
 
+    # def _flush_buffers(self) -> None:
+    #     if not self._buffered_chunks:
+    #         return
+    #
+    #     embedded_chunks = self.embedder.encode_embed(
+    #         text=self._buffered_texts,
+    #         batch_size=self.batch_size_embed
+    #     )
+    #
+    #     rows = [
+    #         (
+    #             chunk.id,
+    #             int(chunk.metadata.get("page", 0)),
+    #             int(chunk.metadata.get("character_offset", 0)),
+    #             chunk.content,
+    #             embedded_chunks[i].tolist(),
+    #         )
+    #         for i, chunk in enumerate(self._buffered_chunks)
+    #     ]
+    #
+    #     self.db.upsert_batch(rows)
+    #
+    #     flushed = len(self._buffered_chunks)
+    #     self._total += flushed
+    #     self._buffered_chunks.clear()
+    #     self._buffered_texts.clear()
+    #
+    #     if self.on_flush:
+    #         self.on_flush(flushed, self._total)
+
     def _flush_buffers(self) -> None:
         if not self._buffered_chunks:
             return
 
-        embedded_chunks = self.embedder.encode_embed(
-            text=self._buffered_texts,
+        # stream-embed the buffered texts in small batches
+        offset = 0
+        for emb_batch in self.embedder.encode_embed_stream(
+            self._buffered_texts,
             batch_size=self.batch_size_embed
-        )
+        ):
+            n = emb_batch.shape[0]
+            slice_chunks = self._buffered_chunks[offset:offset + n]
 
-        rows = [
-            (
-                chunk.id,
-                int(chunk.metadata.get("page", 0)),
-                int(chunk.metadata.get("character_offset", 0)),
-                chunk.content,
-                embedded_chunks[i].tolist(),
-            )
-            for i, chunk in enumerate(self._buffered_chunks)
-        ]
+            rows = [
+                (
+                    ch.id,
+                    int(ch.metadata.get("page", 0)),
+                    int(ch.metadata.get("character_offset", 0)),
+                    ch.content,
+                    emb_batch[i].tolist(),
+                )
+                for i, ch in enumerate(slice_chunks)
+            ]
 
-        self.db.upsert_batch(rows)
+            # upsert immediately per embedded batch (keeps memory flat)
+            self.db.upsert_batch(rows)
+            offset += n
 
         flushed = len(self._buffered_chunks)
         self._total += flushed
@@ -454,7 +551,7 @@ def script(
         min_support=min_support,
         support_similarity=support_similarity
     )
-    click.echo(response)
+    click.echo(f"AI said: {response}")
 
 
 if __name__ == "__main__":
