@@ -4,7 +4,7 @@ import numpy
 import blingfire
 import xml.etree.ElementTree as ETree
 from dataclasses import dataclass
-from typing import List, Generator, Dict
+from typing import List, Generator, Dict, Optional, Tuple
 
 # Import Blingfire, if not found, fallback to simple regex
 # try:
@@ -66,57 +66,83 @@ class XMLChunker:
         self.similarity_floor = similarity_floor
         self.embed_per_batch = batch_size_embed
 
-    # def iterate_chunks(
-    #     self,
-    #     xml_file_path: str
-    # ) -> Generator["Chunk", None, None]:
-    #     block_index = 0
-    #     for raw_text in self._iterate_through_content(xml_file_path):
-    #         pure_text = clean_whitespace(raw_text)
-    #
-    #         if not pure_text:
-    #             block_index += 1
-    #             continue
-    #
-    #         sentences = self._semantic_sentences(pure_text)
-    #         if not sentences:
-    #             block_index += 1
-    #             continue
-    #
-    #         embed_sentences = self.embedder.encode_embed(
-    #             sentences, batch_size=self.embed_per_batch)
-    #         index_group = self._pack_sentences_semantically(
-    #             sentences, embed_sentences)
-    #
-    #         sentence_start_list: List[int] = []
-    #         pos = 0
-    #         for sentence in sentences:
-    #             sentence_start_list.append(pos)
-    #             pos += len(sentence.strip()) + 1
-    #
-    #         for group in index_group:
-    #             sentence_piece = " ".join(
-    #                 sentences[index].strip() for index in group
-    #             ).strip()
-    #             starting_character = sentence_start_list[group[0]] \
-    #                 if group else 0
-    #             chunk_id = f"Chunk-{block_index:06d} Offset-{starting_character:08d}"
-    #             yield Chunk(
-    #                 id=chunk_id,
-    #                 content=sentence_piece,
-    #                 metadata={
-    #                     "page": block_index,
-    #                     "character_offset": int(starting_character)
-    #                 }
-    #             )
-    #         block_index += 1
+    @staticmethod
+    def _sentence_start_position(
+        sentences: List[str]
+    ) -> List[int]:
+        starts, counter = [], 0
+        for start in sentences:
+            starts.append(counter)
+            counter += len(start.strip()) + 1
+        return starts
+
+    @staticmethod
+    def _normalise_embeds(
+            embeds
+    ) -> numpy.ndarray:
+        embed_array = numpy.asarray(embeds, dtype=numpy.float32)
+        normalise = numpy.linalg.norm(
+            embed_array, axis=1, keepdims=True
+        ) + 1e-12
+        return embed_array / normalise
+
+    def _too_big(
+        self,
+        current_tokens: int,
+        next_tokens: int
+    ) -> bool:
+        return current_tokens and (current_tokens + next_tokens > self.max_tokens)
+
+    def _hit_boundary(
+        self,
+        current_tokens: int,
+        similarity: Optional[float]
+    ) -> bool:
+        return (
+            current_tokens >= self.target_tokens
+            and similarity is not None
+            and similarity < self.similarity_floor
+        )
+
+    def _flush_current_buffer(
+        self,
+        block_index: int,
+        sentences: List[str],
+        sentence_starts: List[int],
+        indexes: List[int],
+        current_tokens: int,
+    ) -> Tuple[Optional[Chunk], List[int], int]:
+        if not indexes:
+            return None, indexes, current_tokens
+
+        piece = " ".join(sentences[index].strip() for index in indexes).strip()
+        start_char = sentence_starts[indexes[0]]
+        chunk_id = f"[Chunk_id: {block_index:03d} page: {block_index}]"
+        chunk = Chunk(
+            id=chunk_id,
+            content=piece,
+            metadata={
+                "page": block_index,
+                "character_offset": int(start_char)
+            },
+        )
+
+        if self.intersections > 0:
+            keep = indexes[-self.intersections:]
+            new_tokens = sum(self.embedder.count_tokens(
+                sentences[i]) for i in keep
+            )
+            return chunk, keep[:], new_tokens
+
+        return chunk, [], 0
 
     def iterate_chunks(
         self,
         xml_file_path: str
     ) -> Generator["Chunk", None, None]:
-        import numpy as np  # local import to avoid global dep if you swap backends
+
         block_index = 0
+        bs = max(1, min(self.embed_per_batch, 16))
 
         for raw_text in self._iterate_through_content(xml_file_path):
             pure_text = clean_whitespace(raw_text)
@@ -129,90 +155,59 @@ class XMLChunker:
                 block_index += 1
                 continue
 
-            # Precompute starts once (for offsets)
-            sent_starts: List[int] = []
-            acc = 0
-            for s in sentences:
-                sent_starts.append(acc)
-                acc += len(s.strip()) + 1  # +1 for the join-space
-
-            # Packing state (we build one chunk at a time)
-            current_idxs: List[int] = []
+            starts = self._sentence_start_position(sentences)
+            current_indexes: List[int] = []
             current_tokens = 0
-            prev_embed = None  # last sentence embedding added to the chunk
+            previous_embed = None
 
-            def flush_chunk():
-                nonlocal current_idxs, current_tokens
-                if not current_idxs:
-                    return
-                piece = " ".join(sentences[i].strip()
-                                 for i in current_idxs).strip()
-                start_char = sent_starts[current_idxs[0]]
-                # chunk_id = f"Chunk-{block_index:06d} Offset-{start_char:08d}"
-                chunk_id = f"[Chunk_id: {block_index:03d} page: {block_index}]"
-                yield Chunk(
-                    id=chunk_id,
-                    content=piece,
-                    metadata={"page": block_index,
-                              "character_offset": int(start_char)},
+            for i in range(0, len(sentences), bs):
+                batch_sentences = sentences[i: i + bs]
+                batch_embeds = self._normalise_embeds(
+                    self.embedder.encode_embed(batch_sentences, batch_size=bs)
                 )
-                # prepare overlap for next chunk
-                if self.intersections > 0:
-                    keep = current_idxs[-self.intersections:]
-                    current_idxs = keep[:]
-                    current_tokens = sum(self.embedder.count_tokens(
-                        sentences[i]) for i in current_idxs)
-                else:
-                    current_idxs = []
-                    current_tokens = 0
 
-            # Stream the embeddings in micro-batches (keeps RAM flat)
-            # tiny batch for small VMs
-            bs = max(1, min(self.embed_per_batch, 16))
-            i = 0
-            while i < len(sentences):
-                j = min(i + bs, len(sentences))
-                batch_sents = sentences[i:j]
-                batch_embeds = self.embedder.encode_embed(
-                    batch_sents, batch_size=bs)
+                for k, embed in enumerate(batch_embeds):
+                    index = i + k
+                    token = self.embedder.count_tokens(sentences[index])
 
-                # ensure L2-normalized embeddings (if your backend didn’t)
-                if isinstance(batch_embeds, np.ndarray):
-                    norms = np.linalg.norm(
-                        batch_embeds, axis=1, keepdims=True) + 1e-12
-                    batch_embeds = batch_embeds / norms
+                    if self._too_big(current_tokens, token):
+                        chunk, current_indexes, current_tokens = self._flush_current_buffer(
+                            block_index,
+                            sentences,
+                            starts,
+                            current_indexes,
+                            current_tokens
+                        )
+                        if chunk:
+                            yield chunk
 
-                for k, emb in enumerate(batch_embeds):
-                    idx = i + k
-                    tok = self.embedder.count_tokens(sentences[idx])
+                    cosine_similarity = float(
+                        numpy.dot(previous_embed, embed)
+                    ) if previous_embed is not None else None
+                    if self._hit_boundary(current_tokens, cosine_similarity):
+                        chunk, current_indexes, current_tokens = self._flush_current_buffer(
+                            block_index,
+                            sentences,
+                            starts,
+                            current_indexes,
+                            current_tokens
+                        )
+                        if chunk:
+                            yield chunk
 
-                    # hard cap → flush now
-                    if current_idxs and current_tokens + tok > self.max_tokens:
-                        for ch in flush_chunk():
-                            yield ch
+                    current_indexes.append(index)
+                    current_tokens += token
+                    previous_embed = embed
 
-                    # semantic boundary preference (once soft target reached)
-                    boundary = False
-                    if current_idxs and prev_embed is not None:
-                        # cos sim (embeddings are unit-normalized)
-                        sim = float(np.dot(prev_embed, emb))
-                        if current_tokens >= self.target_tokens and sim < self.similarity_floor:
-                            boundary = True
-
-                    if boundary and current_idxs:
-                        for ch in flush_chunk():
-                            yield ch
-
-                    # add sentence
-                    current_idxs.append(idx)
-                    current_tokens += tok
-                    prev_embed = emb
-
-                i = j
-
-            # flush the tail
-            for ch in flush_chunk():
-                yield ch
+            chunk, current_indexes, current_tokens = self._flush_current_buffer(
+                block_index,
+                sentences,
+                starts,
+                current_indexes,
+                current_tokens
+            )
+            if chunk:
+                yield chunk
 
             block_index += 1
 
@@ -265,17 +260,18 @@ class XMLChunker:
         ]
 
         chunks: List[List[int]] = []
-        iter = 0
-        while iter < n:
-            start_pos = max(0, iter - self.intersections) \
-                if (chunks and self.intersections > 0) else iter
+        iter1 = 0
+        while iter1 < n:
+            start_pos = max(0, iter1 - self.intersections) \
+                if (chunks and self.intersections > 0) else iter1
             current_indexes: List[int] = []
             current_tokens = 0
 
             iter2 = start_pos
-            while iter2 < iter:
+            while iter2 < iter1:
                 current_indexes.append(iter2)
                 current_tokens += tokens[iter2]
+                iter2 += 1
 
             while iter2 < n:
                 if current_tokens + tokens[iter2] > self.max_tokens and current_indexes:
@@ -303,10 +299,10 @@ class XMLChunker:
                         break
 
             if not current_indexes:
-                current_indexes = list(iter)
+                current_indexes = [iter1]
                 iter2 = iter + 1
 
             chunks.append(current_indexes)
-            iter = max(current_indexes[-1] + 1, iter2)
+            iter1 = max(current_indexes[-1] + 1, iter2)
 
         return chunks
