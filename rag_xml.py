@@ -5,9 +5,9 @@ import numpy
 import psycopg
 from groq import Groq
 from psycopg.rows import dict_row
-from transfomers import AutoTokenizer
+from transformers import AutoTokenizer
 from pgvector.psycopg import register_vector
-from typing import List, Tuple, Generator, Iterable
+from typing import List, Tuple, Optional, Iterable
 from sentence_transformers import SentenceTransformer
 from xmlchunker import Chunk, XMLChunker
 
@@ -290,3 +290,172 @@ def get_response(
         print('Chunk_id not found in response')
         return fallback
     return response
+
+
+class XMLIngestor:
+    def __init__(
+        self,
+        db: VectorDBStore,
+        embedder: Embed,
+        semantic: bool = True,
+        soft_target_token: int = 200,
+        max_tokens: int = 400,
+        intersections: int = 10,
+        similarity_floor: float = 0.212,
+        batch_size_embed: int = 256,
+        upsert_batch_size: int = 500,
+        on_flush: Optional[callable] = None
+    ) -> None:
+        self.db = db
+        self.embedder = embedder
+        self.is_semantic = semantic
+        self.target_tokens = soft_target_token
+        self.max_tokens = max_tokens
+        self.intersections = intersections
+        self.similarity_floor = similarity_floor
+        self.upsert_batch_size = upsert_batch_size
+        self.batch_size_embed = batch_size_embed
+        self.on_flush = on_flush
+
+        self._buffered_chunks: List["Chunk"] = []
+        self._buffered_texts: List[str] = []
+        self._total: int = 0
+
+    def ingest(
+        self,
+        xml_file_path: str
+    ) -> int:
+        self._clear_buffers()
+
+        iterate_chunk = self._build_iterator(xml_file_path)
+        for chunk in iterate_chunk:
+            self._buffered_chunks.append(chunk)
+            self._buffered_texts.append(chunk.content)
+            if len(self._buffered_chunks) >= self.upsert_batch_size:
+                self._flush_buffers()
+
+        self._flush_buffers()
+        return self._total
+
+    def _build_iterator(
+        self,
+        xml_file_path: str
+    ) -> Iterable["Chunk"]:
+        # if self.is_semantic:
+        chunker = XMLChunker(
+            embedder=self.embedder,
+            soft_target_token=self.target_tokens,
+            max_tokens=self.max_tokens,
+            intersections=self.intersections,
+            similarity_floor=self.similarity_floor,
+            batch_size_embed=self.batch_size_embed
+        )
+        return chunker.iterate_chunks(xml_file_path)
+
+        # else:
+        # Add code for fallback to legacy regex based chunking
+
+    def _flush_buffers(self) -> None:
+        if not self._buffered_chunks:
+            return
+
+        embedded_chunks = self.embedder.encode_embed(
+            text=self._buffered_texts,
+            batch_size=self.batch_size_embed
+        )
+
+        rows = [
+            (
+                chunk.id,
+                int(chunk.metadata.get("page", 0)),
+                int(chunk.metadata.get("character_offset", 0)),
+                chunk.content,
+                embedded_chunks[i].tolist(),
+            )
+            for i, chunk in enumerate(self._buffered_chunks)
+        ]
+
+        self.db.upsert_batch(rows)
+
+        flushed = len(self._buffered_chunks)
+        self._total += flushed
+        self._buffered_chunks.clear()
+        self._buffered_texts.clear()
+
+        if self.on_flush:
+            self.on_flush(flushed, self._total)
+
+    def _clear_buffers(self) -> None:
+        self._buffered_chunks.clear()
+        self._buffered_texts.clear()
+        self._total = 0
+
+
+@click.command()
+@click.argument("xml_file_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("question", type=str)
+@click.option("--database-url", default="postgres://aalbatrossguy:pgadmin%40123@localhost:5432/vector_db")
+@click.option("--is-semantic/--no-semantic", default=True)
+@click.option("--target-tokens", default=160)
+@click.option("--max-tokens", default=220)
+@click.option("--intersections", default=1)
+@click.option("--similarity-floor", default=0.20)
+@click.option("--min-similarity", default=0.14)
+@click.option("--support-similarity", default=0.06)
+@click.option("--min-support", default=2)
+@click.option("--skip-indexing", is_flag=True, default=False)
+@click.option("--upsert-batch-size", default=1000)
+@click.option("--embed-batch-size", default=128)
+def script(
+    xml_file_path,
+    question,
+    database_url,
+    is_semantic,
+    target_tokens,
+    max_tokens,
+    intersections,
+    similarity_floor,
+    min_similarity,
+    support_similarity,
+    min_support,
+    skip_indexing,
+    upsert_batch_size,
+    embed_batch_size,
+):
+    embedder = Embed()
+    store = VectorDBStore(url=database_url, text_dim=embedder.dim)
+
+    if not skip_indexing:
+        def _progress_log(flushed, current_status):
+            click.echo(f"Flush status: {flushed}, chunks flushed so far: {
+                       current_status}", err=True)
+
+        ingestor = XMLIngestor(
+            db=store,
+            embedder=embedder,
+            semantic=is_semantic,
+            soft_target_token=target_tokens,
+            max_tokens=max_tokens,
+            intersections=intersections,
+            similarity_floor=similarity_floor,
+            batch_size_embed=embed_batch_size,
+            on_flush=_progress_log
+        )
+        total = ingestor.ingest(xml_file_path)
+        click.echo(f"Ingested chunks: {total}")
+
+    retriever = RAGRetrieverModel(vectorStore=store, embedder=embedder)
+    client = groq()
+    response = get_response(
+        query=question,
+        retriever=retriever,
+        client=client,
+        min_similarity=min_similarity,
+        min_support=min_support,
+        support_similarity=support_similarity
+    )
+    click.echo(response)
+
+
+if __name__ == "__main__":
+    script()
