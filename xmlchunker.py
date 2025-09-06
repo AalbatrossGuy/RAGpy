@@ -117,7 +117,7 @@ class XMLChunker:
 
         piece = " ".join(sentences[index].strip() for index in indexes).strip()
         start_char = sentence_starts[indexes[0]]
-        chunk_id = f"[Chunk_id: {block_index:03d} page: {block_index}]"
+        chunk_id = f"{block_index:03d}"
         chunk = Chunk(
             id=chunk_id,
             content=piece,
@@ -300,7 +300,7 @@ class XMLChunker:
 
             if not current_indexes:
                 current_indexes = [iter1]
-                iter2 = iter + 1
+                iter2 = iter1 + 1
 
             chunks.append(current_indexes)
             iter1 = max(current_indexes[-1] + 1, iter2)
