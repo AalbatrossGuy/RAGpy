@@ -1,17 +1,14 @@
 import os
 import click
-import numpy
-import psycopg
 from groq import Groq
+from embedder import Embed
 from dotenv import load_dotenv
-from psycopg.rows import dict_row
+from database import VectorDBStore
 # from transformers import AutoTokenizer
-from pgvector.psycopg import register_vector
+from xmlchunker import Chunk, XMLChunker
 from typing import List, Tuple, Optional, Iterable
 # from sentence_transformers import SentenceTransformer
-from xmlchunker import Chunk, XMLChunker
-from embedder import Embed
-from database import VectorDBStore
+
 
 load_dotenv()
 
