@@ -262,7 +262,7 @@ class XMLIngestor:
 @click.command()
 @click.argument("xml_file_path", type=click.Path(exists=True, dir_okay=False))
 @click.argument("question", type=str)
-@click.option("--database-url", default="postgres://aalbatrossguy:pgadmin%40123@localhost:5432/vector_db")
+@click.option("--database-url", default=os.getenv("DATABASE_URL"))
 @click.option("--is-semantic/--no-semantic", default=True)
 @click.option("--target-tokens", default=160)
 @click.option("--max-tokens", default=220)
