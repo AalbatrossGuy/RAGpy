@@ -1,16 +1,8 @@
-from openai import APIConnectionError, APIStatusError, RateLimitError, APITimeoutError
-from typing import List, Optional
-from dataclasses import dataclass
-import numpy as np
-import math
 import os
 import click
 import numpy
-import time
 import psycopg
-import requests
 from groq import Groq
-from nomic import embed
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
 # from transformers import AutoTokenizer
@@ -18,206 +10,10 @@ from pgvector.psycopg import register_vector
 from typing import List, Tuple, Optional, Iterable
 # from sentence_transformers import SentenceTransformer
 from xmlchunker import Chunk, XMLChunker
+from embedder import Embed
+from database import VectorDBStore
 
 load_dotenv()
-
-
-class VectorDBStore:
-    def __init__(
-        self,
-        url: str,
-        table: str = "chunks",
-        text_dim: int = 768
-    ):
-        self.url = url
-        self.table = table
-        self.dim = text_dim
-        self._ensure_schema()
-
-    def _ensure_schema(self):
-        with psycopg.connect(self.url, autocommit=True) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                cursor.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {self.table} (
-                        chunk_id TEXT PRIMARY KEY,
-                        page INTEGER NOT NULL,
-                        character_offset INTEGER NOT NULL,
-                        content TEXT NOT NULL,
-                        text_embedding VECTOR({self.dim}) NOT NULL
-                    );
-                    """
-                )
-                cursor.execute(
-                    f"""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS(
-                            SELECT 1 FROM pg_class info
-                            JOIN pg_namespace name on name.oid = info.relnamespace
-                            WHERE info.relname = '{self.table}_embedding_index'
-                        ) THEN
-                            CREATE INDEX {self.table}_embedding_index
-                            ON {self.table}
-                            USING ivfflat (text_embedding vector_cosine_ops)
-                            WITH (lists = 100);
-                        END IF;
-                    END$$;
-                    """
-                )
-
-    def upsert_batch(
-        self,
-        batch_rows: List[Tuple[str, int, int, str, list]]
-    ) -> None:
-        if not batch_rows:
-            return
-        with psycopg.connect(self.url) as connection:
-            with connection.cursor() as cursor:
-                cursor.executemany(
-                    f"""
-                    INSERT INTO {self.table}
-                        (chunk_id, page, character_offset, content, text_embedding)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (chunk_id) DO UPDATE SET
-                        page = EXCLUDED.page,
-                        character_offset = EXCLUDED.character_offset,
-                        content = EXCLUDED.content,
-                        text_embedding = EXCLUDED.text_embedding;
-                    """,
-                    batch_rows
-                )
-            connection.commit()
-
-    def search(
-        self,
-        embedded_query: numpy.ndarray,
-        top_k: int = 6
-    ) -> List[Tuple[Chunk, float]]:
-        query_vector = embedded_query.tolist()
-        with psycopg.connect(self.url, row_factory=dict_row) as connection:
-            register_vector(connection)
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT chunk_id, page, character_offset, content,
-                        (text_embedding <=> %s::vector(768)) AS cosine_distance
-                    FROM {self.table}
-                    ORDER BY text_embedding <=> (%s)::vector(768)
-                    LIMIT %s;
-                    """,
-                    (query_vector, query_vector, top_k)
-                )
-                rows = cursor.fetchall()
-
-        out: List[Tuple[Chunk, float]] = []
-        for r in rows:
-            _chunk = Chunk(
-                id=r["chunk_id"],
-                content=r["content"],
-                metadata={
-                    "page": r["page"],
-                    "character_offset": r["character_offset"]
-                }
-            )
-            similarity = float(1.0 - r["cosine_distance"])
-            out.append((_chunk, similarity))
-        return out
-
-
-class Embed:
-    def __init__(
-        self,
-        model: str = "nomic-embed-text-v1.5",
-        dim: int = 768,
-        api_key: Optional[str] = None,
-        request_timeout: int = 60,
-        max_retries: int = 5,
-        backoff_base: float = 0.8,
-        backoff_factor: float = 1.8,
-        l2_normalize: bool = True,
-        task_type: str = "search_document",
-        long_text_mode: str = "truncate",
-        inference_mode: str = "remote"
-    ):
-        self.model = model
-        self.dim = dim
-        self.api_key = api_key or os.getenv("NOMICAI_API_KEY")
-        self.request_timeout = request_timeout
-        self.max_retries = max_retries
-        self.backoff_base = backoff_base
-        self.backoff_factor = backoff_factor
-        self.l2_normalize = l2_normalize
-        self.task_type = task_type
-        self.long_text_mode = long_text_mode
-        self.inference_mode = inference_mode
-
-        if not self.api_key:
-            raise RuntimeError("NOMIC_API_KEY not set")
-
-        os.environ.setdefault("NOMIC_API_KEY", self.api_key)
-
-    def encode_embed(self, texts: List[str], batch_size: int = 64) -> numpy.ndarray:
-        """
-        Returns float32 ndarray of shape [len(texts), self.dim].
-        """
-        if not texts:
-            return numpy.zeros((0, self.dim), dtype=np.float32)
-
-        out: List[List[float]] = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            tries = 0
-            while True:
-                tries += 1
-                try:
-                    resp = embed.text(
-                        texts=batch,
-                        model=self.model,
-                        task_type=self.task_type,
-                        inference_mode="remote",
-                        long_text_mode="truncate",
-                        dimensionality=self.dim,
-                    )
-                    out.extend(resp["embeddings"])
-                    break
-
-                except Exception:
-                    if tries >= self.max_retries:
-                        raise
-                    time.sleep(self._sleep_for(tries))
-                    continue
-
-        arr = numpy.asarray(out, dtype=np.float32)
-
-        if self.l2_normalize and arr.size:
-            norms = numpy.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-            arr = arr / norms
-
-        return arr
-
-    def encode_embed_stream(
-        self,
-        texts_iter: Iterable[str],
-        batch_size: int = 32
-    ):
-        batch: List[str] = []
-        for t in texts_iter:
-            batch.append(t)
-            if len(batch) == batch_size:
-                yield self.encode_embed(batch, batch_size=batch_size)
-                batch.clear()
-        if batch:
-            yield self.encode_embed(batch, batch_size=len(batch))
-
-    def count_tokens(self, text: str) -> int:
-        # very rough token budgeter for chunk sizing
-        return max(1, len(text.split()))
-
-    def _sleep_for(self, attempt: int) -> float:
-        return self.backoff_base * (self.backoff_factor ** (attempt - 1)) + (0.05 * numpy.random.rand())
 
 
 class RAGRetrieverModel:
@@ -241,19 +37,27 @@ class RAGRetrieverModel:
 
 def create_retrieve_context(
     ChunkBlock: List[Tuple[Chunk, float]],
-    max_characters=1000
+    max_characters: int = 500
 ) -> str:
-    buffer, used, total = [], set(), 0
+    buffer: list[str] = []
+    used_ids: set[str] = set()
+    used_texts: set[str] = set()
+    total = 0
+
     for character, score in ChunkBlock:
-        if character.id in used:
+        text = character.content.strip()
+        if character.id in used_ids or text in used_texts:
             continue
-        line = f"[Chunk_id: {character.id} page: {character.metadata.get('page')}] {
-            character.content.strip()}\n"
+
+        line = f"[Chunk_id: {character.id}] {text}\n"
         if total + len(line) > max_characters:
             break
+
         buffer.append(line)
-        used.add(character.id)
+        used_ids.add(character.id)
+        used_texts.add(text)
         total += len(line)
+
     return "".join(buffer)
 
 
@@ -274,7 +78,7 @@ def answer_pass_threshold(
     return supporter >= min_support
 
 
-fallback = "Don't know the answer"
+fallback = "I don't know the answer"
 
 PROMPT = """You are a strict RAG assistant.
 RULES:
@@ -337,7 +141,7 @@ def get_response(
         print('could not pass answer_pass_threshold')
         return fallback
 
-    context = create_retrieve_context(ChunkBlocks, max_characters=1000)
+    context = create_retrieve_context(ChunkBlocks, max_characters=500)
     response = chat(
         client,
         CONTEXT_WITH_QUESTION.format(question=query, context=context)
@@ -415,36 +219,6 @@ class XMLIngestor:
 
         # else:
         # Add code for fallback to legacy regex based chunking
-
-    # def _flush_buffers(self) -> None:
-    #     if not self._buffered_chunks:
-    #         return
-    #
-    #     embedded_chunks = self.embedder.encode_embed(
-    #         text=self._buffered_texts,
-    #         batch_size=self.batch_size_embed
-    #     )
-    #
-    #     rows = [
-    #         (
-    #             chunk.id,
-    #             int(chunk.metadata.get("page", 0)),
-    #             int(chunk.metadata.get("character_offset", 0)),
-    #             chunk.content,
-    #             embedded_chunks[i].tolist(),
-    #         )
-    #         for i, chunk in enumerate(self._buffered_chunks)
-    #     ]
-    #
-    #     self.db.upsert_batch(rows)
-    #
-    #     flushed = len(self._buffered_chunks)
-    #     self._total += flushed
-    #     self._buffered_chunks.clear()
-    #     self._buffered_texts.clear()
-    #
-    #     if self.on_flush:
-    #         self.on_flush(flushed, self._total)
 
     def _flush_buffers(self) -> None:
         if not self._buffered_chunks:
