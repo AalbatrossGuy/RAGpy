@@ -1,9 +1,10 @@
 # Created by AG on 04-08-2025
+
 import re
 import numpy
 import blingfire
-import xml.etree.ElementTree as ETree
 from dataclasses import dataclass
+from xml.etree import ElementTree as ETree
 from typing import List, Generator, Dict, Optional, Tuple
 
 # Import Blingfire, if not found, fallback to simple regex
