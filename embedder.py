@@ -96,6 +96,9 @@ class Embed:
         if batch:
             yield self.encode_embed(batch, batch_size=len(batch))
 
+    def encode_embed_single_sentence(self, text: str):
+        return self.encode_embed([text], batch_size=1)[0]
+
     def count_tokens(self, text: str) -> int:
         return max(1, len(text.split()))
 
